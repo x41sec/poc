@@ -14,8 +14,8 @@ static int cont = 1;
  */
 
 // gcc -g -lpthread -o threadrec threadrec.c 
-//
-// *** > run with argument 261881 as recursion depth
+// *** > run with argument 261881 as recursion depth (or another value on
+// your machine
 //
 
 void main(int argc, char **argv)
