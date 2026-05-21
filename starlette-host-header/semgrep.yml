@@ -1,0 +1,58 @@
+rules:
+  - id: conn_req_url_path
+    languages:
+      - python
+    message: use of untrusted starlette/fastapi url.path
+    options:
+      interfile: true
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+        - patterns:
+          - pattern: $CLASS.url
+          - metavariable-type:
+              metavariable: $CLASS
+              type: starlette.requests.HTTPConnection
+        - patterns:
+          - pattern: $CLASS.url
+          - metavariable-type:
+              metavariable: $CLASS
+              type: fastapi.Request
+        - pattern: starlette.datastructures.URL
+    pattern-sinks:
+      - pattern: ... .path
+    severity: CRITICAL
+
+  - id: conn_req_url
+    languages:
+      - python
+    message: use of untrusted starlette/fastapi url
+    options:
+      interfile: true
+    patterns:
+      - pattern-either:
+        - patterns:
+          - pattern: $CLASS.url
+          - metavariable-type:
+              metavariable: $CLASS
+              type: starlette.requests.HTTPConnection
+        - patterns:
+          - pattern: $CLASS.url
+          - metavariable-type:
+              metavariable: $CLASS
+              type: fastapi.Request
+        - pattern: starlette.datastructures.URL(...)
+    severity: MEDIUM
+
+  - id: req_url_path
+    languages:
+      - python
+    message: use of *req* .url
+    options:
+      interfile: true
+    mode: taint
+    pattern-sources:
+      - pattern-regex: \b(\w*req\w*)\.url
+    pattern-sinks:
+      - pattern: ... .path
+    severity: LOW

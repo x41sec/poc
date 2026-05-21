@@ -1,0 +1,5 @@
+name: starlette-host-header-injection
+version: 0.1.0
+description: CodeQL queries to detect Host header injection vulnerabilities in Starlette/FastAPI applications
+dependencies:
+  codeql/python-all: "*"

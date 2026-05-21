@@ -1,0 +1,8 @@
+# Query suite for Starlette/FastAPI Host header injection vulnerabilities
+- description: "Starlette/FastAPI Host Header Injection Security Queries"
+- queries: .
+- include:
+    id:
+      - py/starlette-url-path-injection
+      - py/starlette-url-usage
+      - py/heuristic-req-url-path
