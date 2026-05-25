@@ -70,8 +70,12 @@ Exit code is `1` when the target is vulnerable, `0` otherwise.
 In addition to the network scanner, this repository provides rules for
 detecting the vulnerable pattern in source code:
 
-- **Semgrep** — `semgrep.yml` flags middleware that derives the request path
-  from the `Host` header for auth decisions.
+- **Semgrep** — `semgrep.yml` finds usages of `request.url` and `.path` in
+  Starlette/FastAPI code that may be influenced by the `Host` header.  The
+  rules use severity levels to express **confidence**, not actual severity:
+  `CRITICAL` = high confidence (type-checked taint from `request.url` →
+  `.path`), `MEDIUM` = medium confidence (any typed `request.url` usage),
+  `LOW` = low confidence (regex-based heuristic matching `*req*.url`).
 - **CodeQL** — tracks data flow from ASGI/WSGI host
   headers through URL construction into authorization checks.
 
